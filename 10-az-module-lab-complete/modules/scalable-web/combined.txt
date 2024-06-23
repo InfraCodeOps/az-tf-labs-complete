@@ -1,0 +1,297 @@
+resource "azurerm_linux_virtual_machine_scale_set" "infra_scale_set" {
+    name                = "vmss-${local.app_code}"
+    resource_group_name = azurerm_resource_group.rg.name
+    location            = azurerm_resource_group.rg.location
+
+    # Using a low-cost sku for the lab
+    sku                 = "Standard_B1s"
+    instances           = var.vm_count
+    admin_username = var.username
+
+    admin_ssh_key {
+        username   = var.username
+        public_key = azapi_resource_action.ssh_public_key_gen.output.publicKey
+    }
+    
+    source_image_reference {
+        publisher = "Canonical"
+        offer     = "0001-com-ubuntu-server-jammy"
+        sku       = "22_04-lts"
+        version   = "latest"
+    }
+    
+    os_disk {
+        caching              = "ReadWrite"
+        storage_account_type = "Standard_LRS"
+    }
+    
+    network_interface {
+        name    = "vmss-nic-${local.app_code}"
+        primary = true
+    
+        ip_configuration {
+            name                          = "vmss-ip-cfg"
+            primary                       = true
+            subnet_id                     = azurerm_subnet.infra_subnet.id
+            load_balancer_backend_address_pool_ids = [azurerm_lb_backend_address_pool.infra_lb_pool.id]
+        }
+    }
+
+    # Ensuring that extensions are installed after the VM is created
+    # Without this, you will need to manually "upgrade"
+    # each VM in the scale set
+    upgrade_mode = "Automatic"
+}
+# Random string of size four, all lower case letters
+resource "random_string" "randomizer" {
+  length  = 4
+  special = false
+  upper   = false
+  numeric = false
+}
+
+# A local variable called app-code that combines the app_prefix and the 
+# random string with a dash in between: <app_prefix>-<random>
+# This will be used in all major resource names as a suffix to ensure uniqueness
+locals {
+  app_code = "${var.app_prefix}-${random_string.randomizer.result}"
+}
+
+############################################
+
+# Resource Group
+resource "azurerm_resource_group" "rg" {
+  location = var.resource_group_location
+  name     = "rg-${local.app_code}"
+}
+
+
+# This resource creates a dynamic script file
+# With  the application name injected into 
+# the bash script. For this, we use a template file
+# and use the templatefile function to inject the
+# application name into the script file
+resource "local_file" "script_file" {
+  filename = "${path.module}/script/installweb.sh"
+  content  = templatefile("${path.module}/script/installweb.tftpl", {
+    app_name = var.app_name
+    app_code = local.app_code
+  })
+}
+
+
+# Virtual Machine Scale Set Extension to install the application
+resource "azurerm_virtual_machine_scale_set_extension" "vmss_script_extension" {
+  name                         = "${azurerm_linux_virtual_machine_scale_set.infra_scale_set.name}-script-extension"
+  virtual_machine_scale_set_id = azurerm_linux_virtual_machine_scale_set.infra_scale_set.id
+  publisher                    = "Microsoft.Azure.Extensions"
+  type                         = "CustomScript"
+  type_handler_version         = "2.0"
+  settings = jsonencode({
+    "script" = base64encode(local_file.script_file.content)
+  })
+  auto_upgrade_minor_version = true
+}
+# Create virtual network
+resource "azurerm_virtual_network" "infra_vnet" {
+  name                = "vnet-${local.app_code}"
+  address_space       = ["10.0.0.0/16"]
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+}
+
+# Create subnet
+resource "azurerm_subnet" "infra_subnet" {
+  name                 = "subnet-${local.app_code}"
+  resource_group_name  = azurerm_resource_group.rg.name
+  virtual_network_name = azurerm_virtual_network.infra_vnet.name
+  address_prefixes     = ["10.0.1.0/24"]
+}
+
+# Create public IP for the Load Balancer
+resource "azurerm_public_ip" "infra_ip" {
+  name                = "ip-${local.app_code}"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  # Dynamic IP might not be available immediately
+  # You might need to reapply config
+  # For immediate availability, use Static
+  allocation_method   = "Static"
+}
+
+# Azure Load Balancer
+resource "azurerm_lb" "infra_lb" {
+  name                = "lb-${local.app_code}"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  frontend_ip_configuration {
+    name                 = "PublicIPAddress"
+    public_ip_address_id = azurerm_public_ip.infra_ip.id
+  }
+}
+
+# Load Balancer Backend Pool
+resource "azurerm_lb_backend_address_pool" "infra_lb_pool" {
+  loadbalancer_id      = azurerm_lb.infra_lb.id
+  name                = "infraBackendPool"
+}
+
+# Load Balancer Rule that allows HTTP traffic
+resource "azurerm_lb_rule" "infra_lb_rule" {
+  loadbalancer_id                = azurerm_lb.infra_lb.id
+  name                          = "HTTP"
+  protocol                      = "Tcp"
+  frontend_port                 = 80
+  backend_port                  = 80
+  frontend_ip_configuration_name = azurerm_lb.infra_lb.frontend_ip_configuration[0].name
+  backend_address_pool_ids = [azurerm_lb_backend_address_pool.infra_lb_pool.id]
+
+  probe_id = azurerm_lb_probe.infra_lb_probe.id
+
+}
+
+# Probe for the Load Balancer
+resource "azurerm_lb_probe" "infra_lb_probe" {
+  loadbalancer_id      = azurerm_lb.infra_lb.id
+  name                = "httpProbe"
+  protocol            = "Http"
+  port                = 80
+  request_path        = "/"
+#   interval_in_seconds = 5
+#   number_of_probes    = 2
+}
+
+resource "azurerm_network_security_group" "infra_nsg" {
+  name                = "nsg-${local.app_code}"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  security_rule {
+    name                       = "HTTP"
+    priority                   = 1001
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "80"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
+}
+
+resource "azurerm_subnet_network_security_group_association" "infra_nsg_association" {
+  subnet_id                 = azurerm_subnet.infra_subnet.id
+  network_security_group_id = azurerm_network_security_group.infra_nsg.id
+}
+
+
+
+# The public key generated by the azapi_resource_action resource
+output "key_data" {
+  value = azapi_resource_action.ssh_public_key_gen.output.publicKey
+  description = "Value of the public key for VMSS machines"
+  sensitive = true
+}
+
+# The private key generated by the azapi_resource_action resource
+output "private_key_data" {
+  value = azapi_resource_action.ssh_public_key_gen.output.privateKey
+  description = "Value of the private key for VMSS machines"
+  sensitive = true
+}
+
+# Public IP of the Load Balancer
+output "lb_public_ip" {
+  value = azurerm_public_ip.infra_ip.ip_address
+  description = "Public IP of the Load Balancer"
+}
+
+# App Code
+output "app_code" {
+  value = local.app_code
+  description = "App Code is a concatnation of the app_prefix and randomizer"
+}
+
+# This code creates an SSH key pair using
+# the azapi_resource and azapi_resource_action resources
+# Alternatively, you could use the TLS functions to generate
+# the SSH key pair
+resource "azapi_resource" "ssh_public_key" {
+  type      = "Microsoft.Compute/sshPublicKeys@2022-11-01"
+  name      = "ssh-${local.app_code}"
+  location  = azurerm_resource_group.rg.location
+  parent_id = azurerm_resource_group.rg.id
+}
+
+resource "azapi_resource_action" "ssh_public_key_gen" {
+  type        = "Microsoft.Compute/sshPublicKeys@2022-11-01"
+  resource_id = azapi_resource.ssh_public_key.id
+  action      = "generateKeyPair"
+  method      = "POST"
+
+  response_export_values = ["publicKey", "privateKey"]
+}
+# This file represents the version requirements 
+# this module has from the Terraform CLI
+# and the providers it uses
+terraform {
+  required_version = "~>1.8"
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~>3.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~>3.0"
+    }
+    azapi = {
+      source  = "azure/azapi"
+      version = "~>1.5"
+    }
+  }
+}
+
+provider "azurerm" {
+  features {}
+}
+
+variable "resource_group_location" {
+  type        = string
+  default     = "centralus"
+  description = "Location of the resource group."
+}
+
+variable "username" {
+  type        = string
+  description = "The username for the local account that will be created on the new VM."
+  default     = "azureadmin"
+}
+
+variable "vm_count" {
+  type        = number
+  description = "The number of VMs to create in the scale set."
+  default     = 2
+  validation {
+    condition     = var.vm_count >= 2 && var.vm_count <= 4
+    error_message = "The number of VMs must be between 2 and 4."
+  }
+}
+
+variable "app_name" {
+  type        = string
+  description = "The name of the application to install on the VMs."
+  default     = "Terraform ScaleSet"
+}
+
+variable "app_prefix" {
+  type        = string
+  description = "Application prefix, 4 lowercase letters."
+  validation {
+    condition     = length(var.app_prefix) == 4 && can(regex("^[a-z]{4}$", var.app_prefix))
+    error_message = "app_prefix must be exactly 4 lowercase letters (a-z)."
+  }
+  default = "demo"
+}
